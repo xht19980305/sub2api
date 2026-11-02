@@ -431,7 +431,7 @@ func RequestedReasoningEffortFromContext(ctx context.Context) *string {
 }
 
 // WithOpenAIReasoningEffortPolicy binds a group policy to a request after its
-// concrete target platform has been resolved to OpenAI. The policy is copied so
+// concrete OpenAI-compatible target platform has been resolved. The policy is copied so
 // retries and asynchronous forwarding cannot observe later slice mutations.
 func WithOpenAIReasoningEffortPolicy(ctx context.Context, maxEffort string, mappings []ReasoningEffortMapping, overLimit string) context.Context {
 	if ctx == nil {
@@ -456,6 +456,68 @@ func ApplyOpenAIReasoningEffortPolicyFromContext(ctx context.Context, body []byt
 		return body, false, nil
 	}
 	return ApplyOpenAIReasoningEffortPolicy(body, policy.maxEffort, policy.mappings, policy.overLimit)
+}
+
+func applyFinalOpenAIReasoningEffortCeiling(ctx context.Context, body []byte, upstreamModel string) ([]byte, bool, error) {
+	if ctx == nil {
+		return body, false, nil
+	}
+	policy, bound := ctx.Value(openAIReasoningEffortPolicyContextKey{}).(openAIReasoningEffortPolicy)
+	if !bound || (policy.maxEffort == "" && len(policy.mappings) == 0) {
+		return body, false, nil
+	}
+	capped, changed, err := ApplyOpenAIReasoningEffortPolicy(body, policy.maxEffort, nil, policy.overLimit)
+	if err != nil {
+		return body, false, err
+	}
+	glmModel := strings.HasPrefix(strings.ToLower(strings.TrimSpace(upstreamModel)), "glm-")
+	for _, path := range []string{"reasoning.effort", "reasoning_effort"} {
+		effort := gjson.GetBytes(capped, path).String()
+		if glmModel && effort != "" && effort != "high" && effort != "max" && (!isGLM53Model(upstreamModel) || effort != "low") {
+			return body, false, fmt.Errorf("%s does not support capped reasoning effort %q: %w", upstreamModel, effort,
+				&ReasoningEffortOverLimitError{Requested: gjson.GetBytes(body, path).String(), Max: NormalizeMaxReasoningEffort(policy.maxEffort)})
+		}
+	}
+	return capped, changed, nil
+}
+
+// applyMessagesConvertedReasoningEffortPolicy validates the final outbound effort.
+// CN mappings already ran on the original Messages model/effort before conversion;
+// only recheck the ceiling here, since conversion/provider normalization may raise
+// the effort. Reapplying mappings would chain rules or match the mapped model.
+// OpenAI keeps its existing post-conversion mapping semantics.
+func applyMessagesConvertedReasoningEffortPolicy(ctx context.Context, account *Account, body []byte, upstreamModel string) ([]byte, bool, error) {
+	if account.Platform != PlatformOpenAI && !IsCNProvider(account.Platform) {
+		return body, false, nil
+	}
+	updated, changed := body, false
+	if account.Platform == PlatformOpenAI {
+		var err error
+		updated, changed, err = ApplyOpenAIReasoningEffortPolicyFromContext(ctx, body)
+		if err != nil {
+			return body, false, err
+		}
+	}
+	if ctx != nil && IsCNProvider(account.Platform) {
+		policy, bound := ctx.Value(openAIReasoningEffortPolicyContextKey{}).(openAIReasoningEffortPolicy)
+		if bound && (policy.maxEffort != "" || len(policy.mappings) > 0) {
+			glmModel := strings.HasPrefix(strings.ToLower(strings.TrimSpace(upstreamModel)), "glm-")
+			if glmModel {
+				if normalized, normalizedChanged := NormalizeGLMOpenAIReasoningEffort(updated, upstreamModel); normalizedChanged {
+					updated, changed = normalized, true
+				}
+			}
+			capped, cappedChanged, capErr := applyFinalOpenAIReasoningEffortCeiling(ctx, updated, upstreamModel)
+			if capErr != nil {
+				return body, false, capErr
+			}
+			updated, changed = capped, changed || cappedChanged
+		}
+	}
+	if err := validateGPT61SolCompatRequest(updated, upstreamModel); err != nil {
+		return body, false, err
+	}
+	return updated, changed, nil
 }
 
 func mapReasoningEffort(raw string, mappings []ReasoningEffortMapping, requestModel string) (string, bool) {

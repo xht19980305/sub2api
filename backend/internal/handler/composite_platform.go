@@ -68,7 +68,7 @@ func openAIReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.APIKe
 		return "", nil, "", false
 	}
 	effectivePlatform := effectiveAPIKeyPlatform(c, apiKey)
-	if effectivePlatform != service.PlatformAnthropic && effectivePlatform != service.PlatformOpenAI {
+	if effectivePlatform != service.PlatformAnthropic && effectivePlatform != service.PlatformOpenAI && !service.IsCNProvider(effectivePlatform) {
 		return "", nil, "", false
 	}
 	maxEffort, mappings := apiKey.Group.MaxReasoningEffort, apiKey.Group.ReasoningEffortMappings
@@ -85,7 +85,7 @@ func anthropicReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.AP
 	if apiKey.Group.Platform != service.PlatformAnthropic && apiKey.Group.Platform != service.PlatformComposite {
 		return "", nil, "", false
 	}
-	if effectiveAPIKeyPlatform(c, apiKey) != service.PlatformAnthropic {
+	if platform := effectiveAPIKeyPlatform(c, apiKey); platform != service.PlatformAnthropic && !service.IsCNProvider(platform) {
 		return "", nil, "", false
 	}
 	maxEffort, mappings := anthropicCompatibleReasoningEffortPolicy(apiKey.Group.MaxReasoningEffort, apiKey.Group.ReasoningEffortMappings)
@@ -142,6 +142,17 @@ func applyOpenAIReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.
 	return service.ApplyOpenAIReasoningEffortPolicy(body, maxEffort, mappings, overLimit)
 }
 
+func applyOpenAIChatCompletionsReasoningEffortPolicyForRequest(c *gin.Context, apiKey *service.APIKey, body []byte) ([]byte, bool, error) {
+	updated, changed, err := applyOpenAIReasoningEffortPolicyForRequest(c, apiKey, body)
+	if err != nil || c == nil || c.Request == nil {
+		return updated, changed, err
+	}
+	if maxEffort, _, overLimit, ok := openAIReasoningEffortPolicyForRequest(c, apiKey); ok {
+		c.Request = c.Request.WithContext(service.WithOpenAIReasoningEffortPolicy(c.Request.Context(), maxEffort, nil, overLimit))
+	}
+	return updated, changed, nil
+}
+
 func respondOpenAIReasoningEffortPolicyError(c *gin.Context, err error, write func(*gin.Context, int, string, string)) {
 	if c == nil || err == nil || write == nil {
 		return
@@ -173,6 +184,9 @@ func bindOpenAIReasoningEffortPolicyForMessagesRequest(c *gin.Context, apiKey *s
 	maxEffort, mappings, overLimit, ok := openAIReasoningEffortPolicyForRequest(c, apiKey)
 	if !ok {
 		return
+	}
+	if service.IsCNProvider(effectiveAPIKeyPlatform(c, apiKey)) {
+		maxEffort, mappings = anthropicCompatibleReasoningEffortPolicy(maxEffort, mappings)
 	}
 	c.Request = c.Request.WithContext(service.WithOpenAIReasoningEffortPolicy(c.Request.Context(), maxEffort, mappings, overLimit))
 }
