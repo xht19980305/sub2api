@@ -1,13 +1,13 @@
 package service
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -660,7 +660,7 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	// 就把已经在出图的上游调用打断成 context canceled，网关记 502、不扣费，而上游那边
 	// 图已经生成并计费。同一端点的 OAuth 分支 forwardOpenAIImagesOAuth 以及 Grok 媒体
 	// 路径本来就无条件脱钩，这里对齐；上游侧仍由 ResponseHeaderTimeout 兜底。
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx, s.openAIImageDrainTimeout())
 	defer releaseUpstreamCtx()
 
 	token, _, err := s.GetAccessToken(upstreamCtx, account)
@@ -1151,9 +1151,13 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	streamInterval := s.openAIImageStreamDataInterval()
 	keepaliveInterval := s.openAIImageStreamKeepaliveInterval()
 	if streamInterval <= 0 && keepaliveInterval <= 0 {
-		reader := bufio.NewReader(resp.Body)
+		reader := newBoundedSSELineReader(resp.Body, s.cfg)
 		for {
-			line, err := reader.ReadBytes('\n')
+			line, err := reader.ReadLine()
+			if errors.Is(err, errSSETransportLimit) {
+				_ = resp.Body.Close()
+				return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, err
+			}
 			processLine(line)
 			if err == io.EOF {
 				break
@@ -1174,11 +1178,16 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	}
 	events := make(chan readEvent, 16)
 	done := make(chan struct{})
+	queueBudget := newSSEQueueBudget(s.cfg)
 	sendEvent := func(ev readEvent) bool {
+		if !queueBudget.acquire(len(ev.line), done) {
+			return false
+		}
 		select {
 		case events <- ev:
 			return true
 		case <-done:
+			queueBudget.release(len(ev.line))
 			return false
 		}
 	}
@@ -1186,9 +1195,9 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	atomic.StoreInt64(&lastReadAt, time.Now().UnixNano())
 	go func() {
 		defer close(events)
-		reader := bufio.NewReader(resp.Body)
+		reader := newBoundedSSELineReader(resp.Body, s.cfg)
 		for {
-			line, err := reader.ReadBytes('\n')
+			line, err := reader.ReadLine()
 			if len(line) > 0 {
 				atomic.StoreInt64(&lastReadAt, time.Now().UnixNano())
 			}
@@ -1229,12 +1238,19 @@ func (s *OpenAIGatewayService) handleOpenAIImagesStreamingResponse(
 	for {
 		select {
 		case ev, ok := <-events:
+			if ok {
+				queueBudget.release(len(ev.line))
+			}
 			if !ok {
 				flushSSEEvent()
 				finalizeFallbackBody()
 				return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, finish()
 			}
 			if ev.err != nil {
+				if errors.Is(ev.err, errSSETransportLimit) {
+					_ = resp.Body.Close()
+					return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, ev.err
+				}
 				flushSSEEvent()
 				return usage, imageCounter.Count(), imageCounter.Sizes(), firstTokenMs, ev.err
 			}
@@ -1804,4 +1820,14 @@ func dedupeStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+// Image generation may continue long enough to incur upstream costs after the
+// client disconnects. Keep its bounded billing drain aligned with image idle
+// configuration, while preserving a safety limit if idle checks are disabled.
+func (s *OpenAIGatewayService) openAIImageDrainTimeout() time.Duration {
+	if timeout := s.openAIImageStreamDataInterval(); timeout > 0 {
+		return timeout
+	}
+	return 900 * time.Second
 }

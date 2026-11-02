@@ -7,7 +7,13 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
+	"github.com/gin-gonic/gin"
 )
+
+func requestBodyMemoryOverload(c *gin.Context, err error) bool {
+	return middleware2.RejectRequestBodyMemoryOverload(c, err)
+}
 
 func extractMaxBytesError(err error) (*http.MaxBytesError, bool) {
 	var maxErr *http.MaxBytesError
