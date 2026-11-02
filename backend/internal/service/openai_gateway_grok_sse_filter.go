@@ -75,7 +75,7 @@ func filterGrokResponsesBillingPings(
 		initialBufferSize = maxLineSize
 	}
 	scanner.Buffer(scanBuf[:0:initialBufferSize], maxLineSize)
-	scanner.Split(scanSSELinesPreservingEndings)
+	scanner.Split(newBoundedSSESplit(nil, maxLineSize, scanSSELinesPreservingEndings))
 
 	// Only frames opened by an `event: ping` line are buffered (pingFrame);
 	// every other frame streams through line by line without copying.

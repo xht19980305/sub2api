@@ -1,8 +1,8 @@
 # Edge and HTTP Ingress Security
 
-Sub2API supports long-lived SSE and WebSocket requests. Protect the request
-ingress without imposing a response `WriteTimeout`: a write deadline would
-terminate healthy long generations and streams.
+Sub2API supports long-lived SSE and WebSocket requests. Protect request ingress
+and individual socket operations without imposing a fixed timeout on the entire
+response. Healthy generations can remain open while an upstream is thinking.
 
 ## Application defaults
 
@@ -15,6 +15,33 @@ terminate healthy long generations and streams.
   image, video, and batch-image endpoints.
 - `gateway.text_max_body_size: 33554432` limits the known pure-text
   `/embeddings` and `/alpha/search` endpoints to 32 MiB.
+- `gateway.request_body_memory_budget_bytes: 1073741824` shares a 1 GiB
+  buffering budget across gateway routes and aliases. Chunk allocations, the
+  contiguous body copy, decompressed output, JSON normalization, and a Zstd
+  decoder reservation are charged before allocation and retained until the
+  handler returns. Exhaustion returns 503 with `Retry-After`; a single-request
+  size violation remains 413. Set this budget to fit the instance's memory,
+  leaving headroom for connections, conversion state, caches and GC. This is
+  conservative ingress accounting, not a hard bound on total heap or RSS.
+- Compressed request output is capped at 64 MiB, with overflow rejected rather
+  than truncated. Zstd additionally has an 8 MiB window cap and one decoder
+  worker per request.
+- `gateway.request_body_read_timeout_seconds: 120` bounds a stalled body read;
+  `gateway.downstream_write_timeout_seconds: 120` bounds each write/flush.
+  Successful operations clear their deadline, so upstream thinking does not
+  consume a whole-response time budget. Zero disables the corresponding limit.
+- `gateway.max_line_size: 41943040` caps SSE lines at 40 MiB by default.
+  `sse_event_max_bytes: 0` inherits that cap for each complete event and
+  `sse_event_max_lines: 4096` also bounds streams of short lines without a blank
+  delimiter. `sse_queue_max_bytes: 8388608` bounds queued payload bytes; a line
+  larger than 8 MiB can occupy the queue alone, up to the line/event cap.
+  The consumer's current line and producer's scanner/read buffer are additional
+  bounded storage. Large inline-image deployments can explicitly raise limits
+  after checking their memory budget.
+- Detached HTTP upstream attempts may continue collecting late billing usage
+  after client cancellation, but only for a finite drain window. The window
+  follows the stream data interval timeout (180 seconds by default; image
+  requests use their 900-second default). Incoming pings do not restart it.
 - H2C defaults to 50 concurrent streams per connection, a 2 MiB connection
   upload window, and a 512 KiB stream upload window.
 - Invalid credential abuse is limited in process by trusted client IP (IPv6
@@ -22,10 +49,29 @@ terminate healthy long generations and streams.
   per-instance safety net; multi-instance enforcement still belongs at the
   load balancer, CDN, or WAF.
 
-Do not add a single application-wide request semaphore: an SSE request may
-legitimately occupy it for many minutes. Apply connection and unauthenticated
-request controls at the edge; authenticated user/API-key concurrency remains
-the application's responsibility.
+Do not replace these controls with a single application-wide request semaphore:
+an SSE request may legitimately occupy it for many minutes. Apply connection
+and unauthenticated request controls at the edge; authenticated user/API-key
+concurrency and buffered request bytes remain the application's responsibility.
+
+Compatibility session caches additionally enforce entry and byte caps with
+active expiry. Monitor 503 body-budget rejections, response-too-large errors,
+allocation rate, retained heap after GC, goroutine counts, usage-worker queues
+and database connection waits when tuning capacity. Notification queues may
+skip best-effort messages on overload or shutdown and log a dropped count;
+committed-charge persistence is not dropped by that notification policy.
+When the platform-quota flusher is disabled, its quota mirror update now runs
+inside the usage task with a separate five-second database deadline. Failures
+remain counted and logged for reconciliation; this path has no durable automatic
+retry. The main charge is committed idempotently before this mirror update.
+Synchronous usage-queue overflow executes in the submitting handler, so the
+configured worker count is not a hard global limit on database concurrency.
+
+Legacy Read tool-call completion still validates the growing JSON argument
+prefix. Incremental storage removes repeated prefix allocations, but validation
+CPU can remain quadratic for large arguments delivered in many small deltas.
+Measure this separately from allocation savings; cumulative bytes allocated in
+benchmarks are not retained heap or RSS.
 
 ## Trusted client IPs
 
