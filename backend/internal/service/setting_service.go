@@ -145,6 +145,10 @@ type SettingService struct {
 	panelRateLimitCache atomic.Value
 	panelRateLimitSF    singleflight.Group
 
+	// registrationEmailBlacklistCache 保存最近一次解析的精确邮箱黑名单
+	// （*registrationEmailBlacklistIndex），原始 JSON 与缓存一致时直接复用。
+	registrationEmailBlacklistCache atomic.Value
+
 	// openAIQuotaAutoPauseSettingsCache holds the most recently observed quota auto-pause
 	// settings. GetOpenAIQuotaAutoPauseSettings reads this atomic.Value on the request hot
 	// path without ever blocking on the DB; when the cached entry expires, a background
