@@ -1178,6 +1178,8 @@ func (s *GatewayService) parseSSEUsage(data string, usage *ClaudeUsage) {
 }
 
 type sseUsagePatch struct {
+	promptTokens             int
+	promptCacheMissTokens    *int
 	inputTokens              int
 	hasInputTokens           bool
 	outputTokens             int
@@ -1206,19 +1208,20 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 			return nil
 		}
 
-		patch := &sseUsagePatch{}
+		patch := extractAnthropicPromptPatch(usageObj)
 		patch.hasInputTokens = true
 		if v, ok := parseSSEUsageInt(usageObj["input_tokens"]); ok {
 			patch.inputTokens = v
 		}
-		patch.hasCacheCreationInput = true
 		if v, ok := parseSSEUsageInt(usageObj["cache_creation_input_tokens"]); ok {
 			patch.cacheCreationInputTokens = v
+			patch.hasCacheCreationInput = true
 		}
-		patch.hasCacheReadInput = true
 		if v, ok := parseSSEUsageInt(usageObj["cache_read_input_tokens"]); ok {
-			patch.cacheReadInputTokens = v
+			patch.cacheReadInputTokens = max(v, 0)
+			patch.hasCacheReadInput = true
 		}
+		applyAnthropicCacheReadAliases(patch, usageObj)
 		if cc, ok := usageObj["cache_creation"].(map[string]any); ok {
 			if v, exists := parseSSEUsageInt(cc["ephemeral_5m_input_tokens"]); exists {
 				patch.cacheCreation5mTokens = v
@@ -1237,7 +1240,7 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 			return nil
 		}
 
-		patch := &sseUsagePatch{}
+		patch := extractAnthropicPromptPatch(usageObj)
 		if v, ok := parseSSEUsageInt(usageObj["input_tokens"]); ok && v > 0 {
 			patch.inputTokens = v
 			patch.hasInputTokens = true
@@ -1246,14 +1249,15 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 			patch.outputTokens = v
 			patch.hasOutputTokens = true
 		}
-		if v, ok := parseSSEUsageInt(usageObj["cache_creation_input_tokens"]); ok && v > 0 {
+		if v, ok := parseSSEUsageInt(usageObj["cache_creation_input_tokens"]); ok && v >= 0 {
 			patch.cacheCreationInputTokens = v
 			patch.hasCacheCreationInput = true
 		}
-		if v, ok := parseSSEUsageInt(usageObj["cache_read_input_tokens"]); ok && v > 0 {
-			patch.cacheReadInputTokens = v
+		if v, ok := parseSSEUsageInt(usageObj["cache_read_input_tokens"]); ok {
+			patch.cacheReadInputTokens = max(v, 0)
 			patch.hasCacheReadInput = true
 		}
+		applyAnthropicCacheReadAliases(patch, usageObj)
 		if cc, ok := usageObj["cache_creation"].(map[string]any); ok {
 			if v, exists := parseSSEUsageInt(cc["ephemeral_5m_input_tokens"]); exists {
 				patch.cacheCreation5mTokens = v
@@ -1270,6 +1274,28 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 	return nil
 }
 
+func extractAnthropicPromptPatch(usageObj map[string]any) *sseUsagePatch {
+	patch := &sseUsagePatch{}
+	patch.promptTokens, _ = parseSSEUsageInt(usageObj["prompt_tokens"])
+	if value, ok := parseSSEUsageInt(usageObj["prompt_cache_miss_tokens"]); ok {
+		patch.promptCacheMissTokens = &value
+	}
+	return patch
+}
+
+func applyAnthropicCacheReadAliases(patch *sseUsagePatch, usageObj map[string]any) {
+	details, _ := usageObj["prompt_tokens_details"].(map[string]any)
+	for _, alias := range []any{usageObj["cached_tokens"], details["cached_tokens"], usageObj["prompt_cache_hit_tokens"]} {
+		if patch.cacheReadInputTokens != 0 {
+			break
+		}
+		if value, ok := parseSSEUsageInt(alias); ok {
+			patch.cacheReadInputTokens = max(value, 0)
+			patch.hasCacheReadInput = true
+		}
+	}
+}
+
 func mergeSSEUsagePatch(usage *ClaudeUsage, patch *sseUsagePatch) {
 	if usage == nil || patch == nil {
 		return
@@ -1280,6 +1306,7 @@ func mergeSSEUsagePatch(usage *ClaudeUsage, patch *sseUsagePatch) {
 	}
 	if patch.hasCacheCreationInput {
 		usage.CacheCreationInputTokens = patch.cacheCreationInputTokens
+		usage.cacheCreationInputTokensPresent = true
 	}
 	if patch.hasCacheReadInput {
 		usage.CacheReadInputTokens = patch.cacheReadInputTokens
@@ -1293,6 +1320,10 @@ func mergeSSEUsagePatch(usage *ClaudeUsage, patch *sseUsagePatch) {
 	if patch.hasCacheCreation1h {
 		usage.CacheCreation1hTokens = patch.cacheCreation1hTokens
 	}
+	if !usage.cacheCreationInputTokensPresent && (patch.hasCacheCreation5m || patch.hasCacheCreation1h) {
+		usage.CacheCreationInputTokens = max(usage.CacheCreation5mTokens, 0) + max(usage.CacheCreation1hTokens, 0)
+	}
+	normalizeAnthropicPromptTotal(usage, patch.promptTokens, patch.promptCacheMissTokens)
 }
 
 func parseSSEUsageInt(value any) (int, bool) {
@@ -1325,24 +1356,19 @@ func parseSSEUsageInt(value any) (int, bool) {
 // applyCacheTTLOverride 将所有 cache creation tokens 归入指定的 TTL 类型。
 // target 为 "5m" 或 "1h"。返回 true 表示发生了变更。
 func applyCacheTTLOverride(usage *ClaudeUsage, target string) bool {
-	// Fallback: 如果只有聚合字段但无 5m/1h 明细，将聚合字段归入 5m 默认类别
-	if usage.CacheCreation5mTokens == 0 && usage.CacheCreation1hTokens == 0 && usage.CacheCreationInputTokens > 0 {
-		usage.CacheCreation5mTokens = usage.CacheCreationInputTokens
-	}
-
-	total := usage.CacheCreation5mTokens + usage.CacheCreation1hTokens
-	if total == 0 {
-		return false
+	total := max(usage.CacheCreationInputTokens, 0)
+	if !usage.cacheCreationInputTokensPresent && total == 0 {
+		total = max(usage.CacheCreation5mTokens, 0) + max(usage.CacheCreation1hTokens, 0)
 	}
 	switch target {
 	case "1h":
-		if usage.CacheCreation1hTokens == total {
+		if usage.CacheCreation1hTokens == total && usage.CacheCreation5mTokens == 0 {
 			return false // 已经全是 1h
 		}
 		usage.CacheCreation1hTokens = total
 		usage.CacheCreation5mTokens = 0
 	default: // "5m"
-		if usage.CacheCreation5mTokens == total {
+		if usage.CacheCreation5mTokens == total && usage.CacheCreation1hTokens == 0 {
 			return false // 已经全是 5m
 		}
 		usage.CacheCreation5mTokens = total
@@ -1354,30 +1380,25 @@ func applyCacheTTLOverride(usage *ClaudeUsage, target string) bool {
 // rewriteCacheCreationJSON 在 JSON usage 对象中重写 cache_creation 嵌套对象的 TTL 分类。
 // usageObj 是 usage JSON 对象（map[string]any）。
 func rewriteCacheCreationJSON(usageObj map[string]any, target string) bool {
-	ccObj, ok := usageObj["cache_creation"].(map[string]any)
-	if !ok {
-		return false
-	}
+	ccObj, _ := usageObj["cache_creation"].(map[string]any)
 	v5m, _ := parseSSEUsageInt(ccObj["ephemeral_5m_input_tokens"])
 	v1h, _ := parseSSEUsageInt(ccObj["ephemeral_1h_input_tokens"])
-	total := v5m + v1h
-	if total == 0 {
+	aggregate, present := parseSSEUsageInt(usageObj["cache_creation_input_tokens"])
+	usage := ClaudeUsage{
+		CacheCreationInputTokens:        aggregate,
+		cacheCreationInputTokensPresent: present,
+		CacheCreation5mTokens:           v5m,
+		CacheCreation1hTokens:           v1h,
+	}
+	if !applyCacheTTLOverride(&usage, target) {
 		return false
 	}
-	switch target {
-	case "1h":
-		if v1h == total {
-			return false
-		}
-		ccObj["ephemeral_1h_input_tokens"] = float64(total)
-		ccObj["ephemeral_5m_input_tokens"] = float64(0)
-	default: // "5m"
-		if v5m == total {
-			return false
-		}
-		ccObj["ephemeral_5m_input_tokens"] = float64(total)
-		ccObj["ephemeral_1h_input_tokens"] = float64(0)
+	if ccObj == nil {
+		ccObj = make(map[string]any)
+		usageObj["cache_creation"] = ccObj
 	}
+	ccObj["ephemeral_5m_input_tokens"] = float64(usage.CacheCreation5mTokens)
+	ccObj["ephemeral_1h_input_tokens"] = float64(usage.CacheCreation1hTokens)
 	return true
 }
 
@@ -1419,13 +1440,8 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
-	// 解析嵌套的 cache_creation 对象中的 5m/1h 明细
-	cc5m := gjson.GetBytes(body, "usage.cache_creation.ephemeral_5m_input_tokens")
-	cc1h := gjson.GetBytes(body, "usage.cache_creation.ephemeral_1h_input_tokens")
-	if cc5m.Exists() || cc1h.Exists() {
-		response.Usage.CacheCreation5mTokens = int(cc5m.Int())
-		response.Usage.CacheCreation1hTokens = int(cc1h.Int())
-	}
+	mergeRawAnthropicCacheCreationUsage(gjson.GetBytes(body, "usage"), &response.Usage)
+	normalizeAnthropicCompatiblePromptUsage(gjson.GetBytes(body, "usage"), &response.Usage)
 
 	// 兼容 Kimi cached_tokens → cache_read_input_tokens
 	if response.Usage.CacheReadInputTokens == 0 {
